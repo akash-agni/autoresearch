@@ -18,8 +18,8 @@ import time
 import numpy as np
 import pandas as pd
 
-from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.linear_model import ElasticNet
+from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -37,7 +37,7 @@ t_start = time.time()
 X_train, X_test, y_train, y_test = load_data()
 
 # ---------------------------------------------------------------------------
-# Feature Engineering
+# Feature Engineering — keep only the most meaningful derived features
 # ---------------------------------------------------------------------------
 
 def add_features(df):
@@ -49,12 +49,6 @@ def add_features(df):
                          + df.get("BsmtFullBath", pd.Series(0, index=df.index)).fillna(0)
                          + 0.5 * df.get("BsmtHalfBath", pd.Series(0, index=df.index)).fillna(0))
     df["qual_sf"]     = df["OverallQual"] * df["GrLivArea"]
-    df["qual_overall"]= df["OverallQual"] * df["OverallCond"]
-    df["total_porch"] = (df.get("OpenPorchSF", 0) + df.get("EnclosedPorch", 0)
-                         + df.get("3SsnPorch", 0) + df.get("ScreenPorch", 0))
-    df["has_garage"]  = (df.get("GarageArea", pd.Series(0, index=df.index)).fillna(0) > 0).astype(int)
-    df["has_bsmt"]    = (df.get("TotalBsmtSF", pd.Series(0, index=df.index)).fillna(0) > 0).astype(int)
-    df["has_pool"]    = (df.get("PoolArea", pd.Series(0, index=df.index)).fillna(0) > 0).astype(int)
     return df
 
 X_train = add_features(X_train)
@@ -67,13 +61,11 @@ y_train_log = np.log1p(y_train)
 num_cols = X_train.select_dtypes(include="number").columns.tolist()
 cat_cols = X_train.select_dtypes(exclude="number").columns.tolist()
 
-# Numeric: median imputation + standard scaling
 num_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="median")),
     ("scaler",  StandardScaler()),
 ])
 
-# Categorical: constant imputation + one-hot encoding
 cat_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
     ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
@@ -85,28 +77,27 @@ preprocessor = ColumnTransformer([
 ])
 
 # ---------------------------------------------------------------------------
-# Model — Ridge with alpha grid search
+# Model — ElasticNet with grid search
 # ---------------------------------------------------------------------------
 
 model = Pipeline([
     ("preprocessor", preprocessor),
-    ("regressor",    Ridge()),
+    ("regressor",    ElasticNet(max_iter=10000)),
 ])
 
-param_grid = {"regressor__alpha": [0.1, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0]}
+param_grid = {
+    "regressor__alpha":   [0.0001, 0.001, 0.01, 0.1],
+    "regressor__l1_ratio":[0.1, 0.3, 0.5, 0.7, 0.9],
+}
 grid_search = GridSearchCV(
     model, param_grid, cv=5,
     scoring="neg_root_mean_squared_error",
     n_jobs=-1,
 )
 
-# ---------------------------------------------------------------------------
-# Cross-validation + fit
-# ---------------------------------------------------------------------------
-
 grid_search.fit(X_train, y_train_log)
-best_model = grid_search.best_estimator_
-best_alpha = grid_search.best_params_["regressor__alpha"]
+best_model  = grid_search.best_estimator_
+best_params = grid_search.best_params_
 cv_rmse_log = -grid_search.best_score_
 
 y_pred_log = best_model.predict(X_test)
@@ -127,6 +118,6 @@ print(f"val_rmse:         {val_rmse:.6f}")
 print(f"cv_rmse_log:      {cv_rmse_log:.6f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"num_features:     {num_features_out}")
-print(f"model:            Ridge(alpha={best_alpha})")
+print(f"model:            ElasticNet(alpha={best_params['regressor__alpha']}, l1={best_params['regressor__l1_ratio']})")
 print(f"train_rows:       {len(X_train)}")
 print(f"test_rows:        {len(X_test)}")
