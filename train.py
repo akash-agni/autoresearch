@@ -18,13 +18,13 @@ import time
 import numpy as np
 import pandas as pd
 
-from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.model_selection import cross_val_score, GridSearchCV
+from sklearn.model_selection import cross_val_score
 
 from prepare import load_data, evaluate, METRIC
 
@@ -37,7 +37,16 @@ t_start = time.time()
 X_train, X_test, y_train, y_test = load_data()
 
 # ---------------------------------------------------------------------------
-# Feature Engineering — keep only the most meaningful derived features
+# Outlier removal (training only)
+# The Ames dataset has known outliers: large homes sold at unusually low prices
+# ---------------------------------------------------------------------------
+
+outlier_mask = ~((X_train["GrLivArea"] > 4000) & (y_train < 200000))
+X_train = X_train[outlier_mask].reset_index(drop=True)
+y_train = y_train[outlier_mask].reset_index(drop=True)
+
+# ---------------------------------------------------------------------------
+# Feature Engineering
 # ---------------------------------------------------------------------------
 
 def add_features(df):
@@ -77,30 +86,31 @@ preprocessor = ColumnTransformer([
 ])
 
 # ---------------------------------------------------------------------------
-# Model — ElasticNet with grid search
+# Model — Ridge alpha=10
 # ---------------------------------------------------------------------------
 
 model = Pipeline([
     ("preprocessor", preprocessor),
-    ("regressor",    ElasticNet(max_iter=10000)),
+    ("regressor",    Ridge(alpha=10.0)),
 ])
 
-param_grid = {
-    "regressor__alpha":   [0.0001, 0.001, 0.01, 0.1],
-    "regressor__l1_ratio":[0.1, 0.3, 0.5, 0.7, 0.9],
-}
-grid_search = GridSearchCV(
-    model, param_grid, cv=5,
-    scoring="neg_root_mean_squared_error",
-    n_jobs=-1,
+# ---------------------------------------------------------------------------
+# Cross-validation
+# ---------------------------------------------------------------------------
+
+cv_scores = cross_val_score(
+    model, X_train, y_train_log,
+    cv=5, scoring="neg_root_mean_squared_error",
 )
+cv_rmse_log = -cv_scores.mean()
 
-grid_search.fit(X_train, y_train_log)
-best_model  = grid_search.best_estimator_
-best_params = grid_search.best_params_
-cv_rmse_log = -grid_search.best_score_
+# ---------------------------------------------------------------------------
+# Final fit + evaluation
+# ---------------------------------------------------------------------------
 
-y_pred_log = best_model.predict(X_test)
+model.fit(X_train, y_train_log)
+
+y_pred_log = model.predict(X_test)
 y_pred     = np.expm1(y_pred_log)
 
 val_rmse = evaluate(y_test, y_pred)
@@ -111,13 +121,13 @@ t_end = time.time()
 # Summary
 # ---------------------------------------------------------------------------
 
-num_features_out = best_model.named_steps["preprocessor"].transform(X_train[:1]).shape[1]
+num_features_out = model.named_steps["preprocessor"].transform(X_train[:1]).shape[1]
 
 print("---")
 print(f"val_rmse:         {val_rmse:.6f}")
 print(f"cv_rmse_log:      {cv_rmse_log:.6f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"num_features:     {num_features_out}")
-print(f"model:            ElasticNet(alpha={best_params['regressor__alpha']}, l1={best_params['regressor__l1_ratio']})")
+print(f"model:            Ridge(alpha=10) + outlier removal")
 print(f"train_rows:       {len(X_train)}")
 print(f"test_rows:        {len(X_test)}")
