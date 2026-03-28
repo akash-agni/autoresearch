@@ -47,7 +47,7 @@ y_train = y_train[outlier_mask].reset_index(drop=True)
 y_train_log = np.log1p(y_train)
 
 # ---------------------------------------------------------------------------
-# Target encoding for Neighborhood (out-of-fold, no leakage)
+# Target encoding — out-of-fold with smoothing
 # ---------------------------------------------------------------------------
 
 def target_encode_oof(train_col, train_target, test_col, n_splits=5, smoothing=10):
@@ -71,12 +71,19 @@ def target_encode_oof(train_col, train_target, test_col, n_splits=5, smoothing=1
 
 X_train = X_train.copy()
 X_test  = X_test.copy()
-X_train["Neighborhood_enc"], X_test["Neighborhood_enc"] = target_encode_oof(
-    X_train["Neighborhood"], y_train_log, X_test["Neighborhood"]
-)
+
+# Target-encode key categorical columns
+te_cols = ["Neighborhood", "MSSubClass", "ExterQual", "BsmtQual", "KitchenQual"]
+for col in te_cols:
+    if col in X_train.columns:
+        tr_col = X_train[col].astype(str).fillna("missing")
+        te_col = X_test[col].astype(str).fillna("missing")
+        X_train[f"{col}_enc"], X_test[f"{col}_enc"] = target_encode_oof(
+            tr_col, y_train_log, te_col
+        )
 
 # ---------------------------------------------------------------------------
-# Feature Engineering — same as best run (04979f6) + no log transforms
+# Feature Engineering
 # ---------------------------------------------------------------------------
 
 def add_features(df):
@@ -93,7 +100,6 @@ def add_features(df):
 X_train = add_features(X_train)
 X_test  = add_features(X_test)
 
-# Keep Neighborhood in cat (OHE) + also have Neighborhood_enc numeric
 num_cols = X_train.select_dtypes(include="number").columns.tolist()
 cat_cols = X_train.select_dtypes(exclude="number").columns.tolist()
 
@@ -147,6 +153,6 @@ print(f"val_rmse:         {val_rmse:.6f}")
 print(f"cv_rmse_log:      {cv_rmse_log:.6f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"num_features:     {num_features_out}")
-print(f"model:            Ridge(alpha=10) + outlier removal + Neighborhood target enc")
+print(f"model:            Ridge(alpha=10) + outlier removal + multi-col target enc")
 print(f"train_rows:       {len(X_train)}")
 print(f"test_rows:        {len(X_test)}")
