@@ -18,13 +18,13 @@ import time
 import numpy as np
 import pandas as pd
 
-from sklearn.linear_model import Lasso
+from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.model_selection import cross_val_score, KFold, GridSearchCV
+from sklearn.model_selection import cross_val_score, KFold
 
 from prepare import load_data, evaluate, METRIC
 
@@ -47,7 +47,7 @@ y_train = y_train[outlier_mask].reset_index(drop=True)
 y_train_log = np.log1p(y_train)
 
 # ---------------------------------------------------------------------------
-# Target encoding for Neighborhood (out-of-fold)
+# Target encoding for Neighborhood (out-of-fold, no leakage)
 # ---------------------------------------------------------------------------
 
 def target_encode_oof(train_col, train_target, test_col, n_splits=5, smoothing=10):
@@ -76,64 +76,26 @@ X_train["Neighborhood_enc"], X_test["Neighborhood_enc"] = target_encode_oof(
 )
 
 # ---------------------------------------------------------------------------
-# Feature Engineering — log-transform skewed features, drop originals
+# Feature Engineering — same as best run (04979f6) + no log transforms
 # ---------------------------------------------------------------------------
 
 def add_features(df):
     df = df.copy()
-    # Age
-    df["house_age"]       = df["YrSold"] - df["YearBuilt"]
-    df["remodel_age"]     = df["YrSold"] - df["YearRemodAdd"]
-    df["is_new"]          = (df["house_age"] <= 1).astype(int)
-    df["is_remodeled"]    = (df["YearRemodAdd"] != df["YearBuilt"]).astype(int)
-
-    # Area — log-transform and DROP originals to avoid collinearity
-    bsmt_sf = df["TotalBsmtSF"].fillna(0)
-    total_sf = bsmt_sf + df["1stFlrSF"] + df["2ndFlrSF"]
-    df["log_GrLivArea"]   = np.log1p(df["GrLivArea"].clip(lower=0))
-    df["log_LotArea"]     = np.log1p(df["LotArea"].clip(lower=0))
-    df["log_total_sf"]    = np.log1p(total_sf.clip(lower=0))
-    df["log_bsmt_sf"]     = np.log1p(bsmt_sf.clip(lower=0))
-    df["log_1stFlrSF"]    = np.log1p(df["1stFlrSF"].clip(lower=0))
-
-    # Bathrooms
-    bsmt_full = df.get("BsmtFullBath", pd.Series(0, index=df.index)).fillna(0)
-    bsmt_half = df.get("BsmtHalfBath", pd.Series(0, index=df.index)).fillna(0)
-    df["total_baths"]     = df["FullBath"] + 0.5 * df["HalfBath"] + bsmt_full + 0.5 * bsmt_half
-
-    # Quality interactions (on log-scale area)
-    df["qual_log_sf"]     = df["OverallQual"] * df["log_GrLivArea"]
-    df["qual_cond"]       = df["OverallQual"] * df["OverallCond"]
-    df["qual_age"]        = df["OverallQual"] / (df["house_age"] + 1)
-
-    # Garage
-    garage_area = df.get("GarageArea", pd.Series(0, index=df.index)).fillna(0)
-    garage_cars = df.get("GarageCars", pd.Series(0, index=df.index)).fillna(0)
-    df["log_garage_area"] = np.log1p(garage_area.clip(lower=0))
-    df["has_garage"]      = (garage_area > 0).astype(int)
-    df["garage_cars"]     = garage_cars
-
-    # Basement flags
-    df["has_bsmt"]        = (bsmt_sf > 0).astype(int)
-
-    # Porch
-    porch_cols = ["OpenPorchSF", "EnclosedPorch", "3SsnPorch", "ScreenPorch"]
-    total_porch = sum(df.get(c, pd.Series(0, index=df.index)) for c in porch_cols)
-    df["log_total_porch"] = np.log1p(total_porch.clip(lower=0))
-
-    # Drop raw area cols to avoid collinearity
-    drop_cols = ["GrLivArea", "LotArea", "TotalBsmtSF", "1stFlrSF", "2ndFlrSF",
-                 "GarageArea", "OpenPorchSF", "EnclosedPorch", "3SsnPorch", "ScreenPorch"]
-    df = df.drop(columns=[c for c in drop_cols if c in df.columns])
-
+    df["house_age"]   = df["YrSold"] - df["YearBuilt"]
+    df["remodel_age"] = df["YrSold"] - df["YearRemodAdd"]
+    df["total_sf"]    = df["TotalBsmtSF"].fillna(0) + df["1stFlrSF"] + df["2ndFlrSF"]
+    df["total_baths"] = (df["FullBath"] + 0.5 * df["HalfBath"]
+                         + df.get("BsmtFullBath", pd.Series(0, index=df.index)).fillna(0)
+                         + 0.5 * df.get("BsmtHalfBath", pd.Series(0, index=df.index)).fillna(0))
+    df["qual_sf"]     = df["OverallQual"] * df["GrLivArea"]
     return df
 
 X_train = add_features(X_train)
 X_test  = add_features(X_test)
 
-# Exclude raw Neighborhood (already target-encoded)
+# Keep Neighborhood in cat (OHE) + also have Neighborhood_enc numeric
 num_cols = X_train.select_dtypes(include="number").columns.tolist()
-cat_cols = [c for c in X_train.select_dtypes(exclude="number").columns if c != "Neighborhood"]
+cat_cols = X_train.select_dtypes(exclude="number").columns.tolist()
 
 num_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="median")),
@@ -151,26 +113,23 @@ preprocessor = ColumnTransformer([
 ])
 
 # ---------------------------------------------------------------------------
-# Model — Lasso for automatic feature selection
+# Model — Ridge alpha=10
 # ---------------------------------------------------------------------------
 
 model = Pipeline([
     ("preprocessor", preprocessor),
-    ("regressor",    Lasso(max_iter=10000)),
+    ("regressor",    Ridge(alpha=10.0)),
 ])
 
-param_grid = {"regressor__alpha": [0.0001, 0.0005, 0.001, 0.005, 0.01]}
-grid_search = GridSearchCV(
-    model, param_grid, cv=5,
-    scoring="neg_root_mean_squared_error",
-    n_jobs=-1,
+cv_scores = cross_val_score(
+    model, X_train, y_train_log,
+    cv=5, scoring="neg_root_mean_squared_error",
 )
-grid_search.fit(X_train, y_train_log)
-best_model  = grid_search.best_estimator_
-best_alpha  = grid_search.best_params_["regressor__alpha"]
-cv_rmse_log = -grid_search.best_score_
+cv_rmse_log = -cv_scores.mean()
 
-y_pred_log = best_model.predict(X_test)
+model.fit(X_train, y_train_log)
+
+y_pred_log = model.predict(X_test)
 y_pred     = np.expm1(y_pred_log)
 
 val_rmse = evaluate(y_test, y_pred)
@@ -181,13 +140,13 @@ t_end = time.time()
 # Summary
 # ---------------------------------------------------------------------------
 
-num_features_out = best_model.named_steps["preprocessor"].transform(X_train[:1]).shape[1]
+num_features_out = model.named_steps["preprocessor"].transform(X_train[:1]).shape[1]
 
 print("---")
 print(f"val_rmse:         {val_rmse:.6f}")
 print(f"cv_rmse_log:      {cv_rmse_log:.6f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"num_features:     {num_features_out}")
-print(f"model:            Lasso(alpha={best_alpha}) + log features + target enc")
+print(f"model:            Ridge(alpha=10) + outlier removal + Neighborhood target enc")
 print(f"train_rows:       {len(X_train)}")
 print(f"test_rows:        {len(X_test)}")
