@@ -18,12 +18,13 @@ import time
 import numpy as np
 import pandas as pd
 
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OrdinalEncoder
-from sklearn.model_selection import cross_val_score
-import xgboost as xgb
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import cross_val_score, KFold
 
 from prepare import load_data, evaluate, METRIC
 
@@ -44,37 +45,118 @@ X_train = X_train[outlier_mask].reset_index(drop=True)
 y_train = y_train[outlier_mask].reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
-# Feature Engineering
+# Target encoding for Neighborhood (out-of-fold to avoid leakage)
+# ---------------------------------------------------------------------------
+
+def target_encode_oof(train_col, train_target, test_col, n_splits=5, smoothing=10):
+    """Smooth out-of-fold target encoding."""
+    global_mean = train_target.mean()
+    train_enc = np.zeros(len(train_col))
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(train_col)):
+        fold_map = (
+            train_target.iloc[tr_idx]
+            .groupby(train_col.iloc[tr_idx])
+            .agg(["mean", "count"])
+        )
+        fold_map["smooth"] = (
+            (fold_map["mean"] * fold_map["count"] + global_mean * smoothing)
+            / (fold_map["count"] + smoothing)
+        )
+        train_enc[val_idx] = train_col.iloc[val_idx].map(fold_map["smooth"]).fillna(global_mean).values
+
+    # Test encoding: use full training set stats
+    full_map = (
+        train_target.groupby(train_col)
+        .agg(["mean", "count"])
+    )
+    full_map["smooth"] = (
+        (full_map["mean"] * full_map["count"] + global_mean * smoothing)
+        / (full_map["count"] + smoothing)
+    )
+    test_enc = test_col.map(full_map["smooth"]).fillna(global_mean).values
+    return train_enc, test_enc
+
+y_train_log = np.log1p(y_train)
+
+neigh_train_enc, neigh_test_enc = target_encode_oof(
+    X_train["Neighborhood"], y_train_log,
+    X_test["Neighborhood"],
+)
+X_train = X_train.copy()
+X_test  = X_test.copy()
+X_train["Neighborhood_enc"] = neigh_train_enc
+X_test["Neighborhood_enc"]  = neigh_test_enc
+
+# ---------------------------------------------------------------------------
+# Feature Engineering — extensive
 # ---------------------------------------------------------------------------
 
 def add_features(df):
     df = df.copy()
-    df["house_age"]   = df["YrSold"] - df["YearBuilt"]
-    df["remodel_age"] = df["YrSold"] - df["YearRemodAdd"]
-    df["total_sf"]    = df["TotalBsmtSF"].fillna(0) + df["1stFlrSF"] + df["2ndFlrSF"]
-    df["total_baths"] = (df["FullBath"] + 0.5 * df["HalfBath"]
-                         + df.get("BsmtFullBath", pd.Series(0, index=df.index)).fillna(0)
-                         + 0.5 * df.get("BsmtHalfBath", pd.Series(0, index=df.index)).fillna(0))
-    df["qual_sf"]     = df["OverallQual"] * df["GrLivArea"]
+    # Age features
+    df["house_age"]       = df["YrSold"] - df["YearBuilt"]
+    df["remodel_age"]     = df["YrSold"] - df["YearRemodAdd"]
+    df["is_new"]          = (df["house_age"] <= 1).astype(int)
+    df["is_remodeled"]    = (df["YearRemodAdd"] != df["YearBuilt"]).astype(int)
+
+    # Area aggregates
+    bsmt_sf = df["TotalBsmtSF"].fillna(0)
+    df["total_sf"]        = bsmt_sf + df["1stFlrSF"] + df["2ndFlrSF"]
+    df["living_ratio"]    = df["GrLivArea"] / (df["total_sf"] + 1)
+
+    # Bathroom features
+    bsmt_full  = df.get("BsmtFullBath",  pd.Series(0, index=df.index)).fillna(0)
+    bsmt_half  = df.get("BsmtHalfBath",  pd.Series(0, index=df.index)).fillna(0)
+    df["total_baths"]     = df["FullBath"] + 0.5 * df["HalfBath"] + bsmt_full + 0.5 * bsmt_half
+    df["bath_sf_ratio"]   = df["total_baths"] / (df["GrLivArea"] + 1) * 1000
+
+    # Quality interactions
+    df["qual_sf"]         = df["OverallQual"] * df["GrLivArea"]
+    df["qual_total_sf"]   = df["OverallQual"] * df["total_sf"]
+    df["qual_cond"]       = df["OverallQual"] * df["OverallCond"]
+    df["qual_age"]        = df["OverallQual"] / (df["house_age"] + 1)
+
+    # Garage
+    garage_area = df.get("GarageArea", pd.Series(0, index=df.index)).fillna(0)
+    garage_cars = df.get("GarageCars", pd.Series(0, index=df.index)).fillna(0)
+    df["garage_area"]     = garage_area
+    df["has_garage"]      = (garage_area > 0).astype(int)
+    df["garage_qual"]     = garage_cars * df["OverallQual"]
+
+    # Basement
+    df["bsmt_sf"]         = bsmt_sf
+    df["has_bsmt"]        = (bsmt_sf > 0).astype(int)
+    df["bsmt_ratio"]      = bsmt_sf / (df["total_sf"] + 1)
+
+    # Porch
+    porch_cols = ["OpenPorchSF", "EnclosedPorch", "3SsnPorch", "ScreenPorch"]
+    df["total_porch"]     = sum(df.get(c, 0) for c in porch_cols)
+
+    # Log-transform skewed area features (after deriving them)
+    for col in ["GrLivArea", "LotArea", "total_sf", "qual_sf", "bsmt_sf"]:
+        if col in df.columns:
+            df[f"log_{col}"] = np.log1p(df[col].clip(lower=0))
+
     return df
 
 X_train = add_features(X_train)
 X_test  = add_features(X_test)
 
-# Log-transform target
-y_train_log = np.log1p(y_train)
-
-# Identify column types
+# Identify column types (drop original Neighborhood — encoded version kept)
 num_cols = X_train.select_dtypes(include="number").columns.tolist()
-cat_cols = X_train.select_dtypes(exclude="number").columns.tolist()
+cat_cols = [c for c in X_train.select_dtypes(exclude="number").columns if c != "Neighborhood"]
 
+# Numeric: median imputation + standard scaling
 num_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="median")),
+    ("scaler",  StandardScaler()),
 ])
 
+# Categorical: constant imputation + one-hot encoding
 cat_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-    ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
+    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
 ])
 
 preprocessor = ColumnTransformer([
@@ -82,35 +164,32 @@ preprocessor = ColumnTransformer([
     ("cat", cat_pipeline, cat_cols),
 ])
 
-X_train_proc = preprocessor.fit_transform(X_train)
-X_test_proc  = preprocessor.transform(X_test)
-
 # ---------------------------------------------------------------------------
-# Model — XGBoost with outlier-cleaned data
+# Model — Ridge alpha=10
 # ---------------------------------------------------------------------------
 
-model = xgb.XGBRegressor(
-    n_estimators=500,
-    learning_rate=0.05,
-    max_depth=4,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    reg_alpha=0.1,
-    reg_lambda=5.0,
-    min_child_weight=5,
-    random_state=42,
-    n_jobs=-1,
-)
+model = Pipeline([
+    ("preprocessor", preprocessor),
+    ("regressor",    Ridge(alpha=10.0)),
+])
+
+# ---------------------------------------------------------------------------
+# Cross-validation
+# ---------------------------------------------------------------------------
 
 cv_scores = cross_val_score(
-    model, X_train_proc, y_train_log,
+    model, X_train, y_train_log,
     cv=5, scoring="neg_root_mean_squared_error",
 )
 cv_rmse_log = -cv_scores.mean()
 
-model.fit(X_train_proc, y_train_log)
+# ---------------------------------------------------------------------------
+# Final fit + evaluation
+# ---------------------------------------------------------------------------
 
-y_pred_log = model.predict(X_test_proc)
+model.fit(X_train, y_train_log)
+
+y_pred_log = model.predict(X_test)
 y_pred     = np.expm1(y_pred_log)
 
 val_rmse = evaluate(y_test, y_pred)
@@ -121,11 +200,13 @@ t_end = time.time()
 # Summary
 # ---------------------------------------------------------------------------
 
+num_features_out = model.named_steps["preprocessor"].transform(X_train[:1]).shape[1]
+
 print("---")
 print(f"val_rmse:         {val_rmse:.6f}")
 print(f"cv_rmse_log:      {cv_rmse_log:.6f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"num_features:     {X_train_proc.shape[1]}")
-print(f"model:            XGBRegressor + outlier removal")
+print(f"num_features:     {num_features_out}")
+print(f"model:            Ridge(alpha=10) + rich features + target enc")
 print(f"train_rows:       {len(X_train)}")
 print(f"test_rows:        {len(X_test)}")
