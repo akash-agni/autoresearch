@@ -18,13 +18,12 @@ import time
 import numpy as np
 import pandas as pd
 
-from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.model_selection import cross_val_score, GridSearchCV
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.model_selection import cross_val_score
+import xgboost as xgb
 
 from prepare import load_data, evaluate, METRIC
 
@@ -71,12 +70,11 @@ cat_cols = X_train.select_dtypes(exclude="number").columns.tolist()
 
 num_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="median")),
-    ("scaler",  StandardScaler()),
 ])
 
 cat_pipeline = Pipeline([
     ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-    ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+    ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
 ])
 
 preprocessor = ColumnTransformer([
@@ -84,28 +82,35 @@ preprocessor = ColumnTransformer([
     ("cat", cat_pipeline, cat_cols),
 ])
 
+X_train_proc = preprocessor.fit_transform(X_train)
+X_test_proc  = preprocessor.transform(X_test)
+
 # ---------------------------------------------------------------------------
-# Model — Ridge with alpha grid search
+# Model — XGBoost with outlier-cleaned data
 # ---------------------------------------------------------------------------
 
-model = Pipeline([
-    ("preprocessor", preprocessor),
-    ("regressor",    Ridge()),
-])
-
-param_grid = {"regressor__alpha": [1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]}
-grid_search = GridSearchCV(
-    model, param_grid, cv=5,
-    scoring="neg_root_mean_squared_error",
+model = xgb.XGBRegressor(
+    n_estimators=500,
+    learning_rate=0.05,
+    max_depth=4,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.1,
+    reg_lambda=5.0,
+    min_child_weight=5,
+    random_state=42,
     n_jobs=-1,
 )
 
-grid_search.fit(X_train, y_train_log)
-best_model  = grid_search.best_estimator_
-best_alpha  = grid_search.best_params_["regressor__alpha"]
-cv_rmse_log = -grid_search.best_score_
+cv_scores = cross_val_score(
+    model, X_train_proc, y_train_log,
+    cv=5, scoring="neg_root_mean_squared_error",
+)
+cv_rmse_log = -cv_scores.mean()
 
-y_pred_log = best_model.predict(X_test)
+model.fit(X_train_proc, y_train_log)
+
+y_pred_log = model.predict(X_test_proc)
 y_pred     = np.expm1(y_pred_log)
 
 val_rmse = evaluate(y_test, y_pred)
@@ -116,13 +121,11 @@ t_end = time.time()
 # Summary
 # ---------------------------------------------------------------------------
 
-num_features_out = best_model.named_steps["preprocessor"].transform(X_train[:1]).shape[1]
-
 print("---")
 print(f"val_rmse:         {val_rmse:.6f}")
 print(f"cv_rmse_log:      {cv_rmse_log:.6f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"num_features:     {num_features_out}")
-print(f"model:            Ridge(alpha={best_alpha}) + outlier removal")
+print(f"num_features:     {X_train_proc.shape[1]}")
+print(f"model:            XGBRegressor + outlier removal")
 print(f"train_rows:       {len(X_train)}")
 print(f"test_rows:        {len(X_test)}")
